@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,15 @@ void sleep_ms(size_t ms)
 #else
 	usleep(1000 * ms);
 #endif
+}
+
+/**
+ * \return Current timestamp in ms.
+ */
+int64_t get_timestamp_in_ms()
+{
+	const auto now_point = std::chrono::system_clock::now();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(now_point.time_since_epoch()).count();
 }
 
 std::string trim (std::string s, const std::string& trails)
@@ -131,23 +141,28 @@ inline void read_uint32(uint32_t * value, uint8_t * p) {
 	*value = ((uint32_t)(p[0]<<24)) | ((uint32_t)(p[1]<<16)) | ((uint32_t)(p[2]<<8)) | ((uint32_t)(p[3]<<0));
 }
 
+/**
+ * @param[in] conn_id Connection ID.
+ * @param[in] data Data to send.
+ * @param[in] timeout_ms Timeout in ms for executing a function.
+ * \return Function execution time in ms.
+ */
 int adaptive_wait_send(conn_id_t conn_id, std::vector<uint8_t> data, int timeout_ms)
 {
 	bool send_ok = false;
-	int delay = 2;
-	int total_delay = 0;
-	while (!send_ok && (total_delay + delay < timeout_ms)) {
+	int delay_ms = 2;
+	int64_t start_timestamp_ms = get_timestamp_in_ms();
+	while (!send_ok && ((int)(get_timestamp_in_ms() - start_timestamp_ms) < timeout_ms)) {
 		try {
 			instance->send_data(conn_id, data);
 			send_ok = true;
 		} catch (std::runtime_error &exc) {
 			_UNUSED(exc)
-			sleep_ms(delay);
-			delay = (int)(delay * 1.5);
-			total_delay += delay;
+			sleep_ms(delay_ms);
+			delay_ms = (int)(delay_ms * 1.5);
 		}
 	}
-	return total_delay;
+	return (int)(get_timestamp_in_ms() - start_timestamp_ms);
 }
 
 void callback_data(conn_id_t conn_id, std::vector<uint8_t> data) {
@@ -245,34 +260,32 @@ int bindy_setkey(const char* name) {
 	return true;
 }
 
-void sleep_until_recv(conn_id_t conn_id, int timeout)
+void sleep_until_recv(conn_id_t conn_id, int timeout_ms)
 {
-	int time_elapsed = 0;
 	bool flag;
+	int64_t start_timestamp_ms = get_timestamp_in_ms();
 	do {
-		time_elapsed += SLEEP_WAIT_TIME_MS;
 		sleep_ms(SLEEP_WAIT_TIME_MS);
 		tlock lock(global_mutex);
 		if (s_enum.count(conn_id) == 0)
 			flag = false;
 		else
 			flag = s_enum[conn_id].recv;
-	} while (!flag && (time_elapsed < timeout));
+	} while (!flag && ((int)(get_timestamp_in_ms() - start_timestamp_ms) < timeout_ms));
 }
 
-void sleep_until_open(uint32_t serial, int timeout)
+void sleep_until_open(uint32_t serial, int timeout_ms)
 {
-	int time_elapsed = 0;
 	bool flag;
+	int64_t start_timestamp_ms = get_timestamp_in_ms();
 	do {
-		time_elapsed += SLEEP_WAIT_TIME_MS;
 		sleep_ms(SLEEP_WAIT_TIME_MS);
 		tlock lock(global_mutex);
 		if (open_ok.count(serial) == 0)
 			flag = false;
 		else
 			flag = open_ok[serial];
-	} while ( (false == flag) && (time_elapsed < timeout) );
+	} while (!flag && ((int)(get_timestamp_in_ms() - start_timestamp_ms) < timeout_ms));
 }
 
 int bindy_enumerate(const char * addr, int enum_timeout, uint8_t ** ptr)
@@ -280,7 +293,7 @@ int bindy_enumerate(const char * addr, int enum_timeout, uint8_t ** ptr)
 	return bindy_enumerate_specify_adapter(addr, "", enum_timeout, ptr);
 }
 
-int bindy_enumerate_specify_adapter(const char* addr, const char* adapter_addr, int enum_timeout, uint8_t** ptr)
+int bindy_enumerate_specify_adapter(const char* addr, const char* adapter_addr, int enum_timeout_ms, uint8_t** ptr)
 {
 	if (!bindy_init())
 		return -1;
@@ -293,10 +306,11 @@ int bindy_enumerate_specify_adapter(const char* addr, const char* adapter_addr, 
 		std::vector<uint8_t> s(7 * 4, 0);
 		uint32_to_buf(CURRENT_PROTOCOL_VERSION, &s.at(0));
 		uint32_to_buf(data_pkt::EnumerateRequest, &s.at(4));
-
+		int64_t current_timestamp_ms = get_timestamp_in_ms();
 		enum_conn_id = instance->connect(addr, adapter_addr);
-		int initial_timeout = adaptive_wait_send(enum_conn_id, s, enum_timeout); // send enum request
-		sleep_until_recv(enum_conn_id, enum_timeout - initial_timeout);
+		int time_left_after_connection_ms = (int)(current_timestamp_ms + enum_timeout_ms - get_timestamp_in_ms());
+		int time_spent_to_send_ms = adaptive_wait_send(enum_conn_id, s, time_left_after_connection_ms); // send enum request
+		sleep_until_recv(enum_conn_id, time_left_after_connection_ms - time_spent_to_send_ms);
 
 		tlock lock(global_mutex);
 		if (!s_enum[enum_conn_id].recv) {
@@ -356,16 +370,19 @@ uint32_t bindy_open(const char * addr, uint32_t serial, int open_timeout)
 	global_mutex.lock();
 	open_ok[serial] = false;
 	global_mutex.unlock();
-	int initial_timeout;
+	int timeout_to_open_ms = open_timeout;
 	try {
+		int64_t current_timestamp_ms = get_timestamp_in_ms();
 		conn_id = instance->connect(addr);
-		initial_timeout = adaptive_wait_send(conn_id, request, open_timeout);
+		int time_left_after_connection_ms = (int)(current_timestamp_ms + open_timeout - get_timestamp_in_ms());
+		int time_spent_to_send_ms = adaptive_wait_send(conn_id, request, time_left_after_connection_ms);
+		timeout_to_open_ms = time_left_after_connection_ms - time_spent_to_send_ms;
 	} catch (...) {
 		instance->disconnect(conn_id);
 		return conn_id_invalid;
 	}
 
-	sleep_until_open(serial, open_timeout-initial_timeout);
+	sleep_until_open(serial, timeout_to_open_ms);
 
 	tlock lock(global_mutex);
 	bool ok = open_ok[serial];
